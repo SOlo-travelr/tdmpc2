@@ -12,7 +12,17 @@ class TensorWrapper(gym.Wrapper):
 
 	def __init__(self, env):
 		super().__init__(env)
-	
+
+	@property
+	def max_episode_steps(self):
+		env = self.env
+		while env is not None:
+			steps = getattr(env, "max_episode_steps", None)
+			if steps is not None:
+				return steps
+			env = getattr(env, "env", None)
+		raise AttributeError("max_episode_steps not found in wrapped environment chain")
+
 	def rand_act(self):
 		return torch.from_numpy(self.action_space.sample().astype(np.float32))
 

@@ -51,7 +51,7 @@ class OnlineTrainer(Trainer):
 			episode_length= np.nanmean(ep_lengths),
 		)
 
-	def to_td(self, obs, action=None, reward=None, terminated=None):
+	def to_td(self, obs, action=None, reward=None, terminated=None, cost=None):
 		"""Creates a TensorDict for a new episode."""
 		if isinstance(obs, dict):
 			obs = TensorDict(obs, batch_size=(), device='cpu')
@@ -69,6 +69,12 @@ class OnlineTrainer(Trainer):
 			reward=reward.unsqueeze(0),
 			terminated=terminated.unsqueeze(0),
 		batch_size=(1,))
+		if self.cfg.get('use_cost_head', False):
+			if cost is None:
+				cost = torch.tensor(float('nan'))
+			elif not isinstance(cost, torch.Tensor):
+				cost = torch.tensor(float(cost))
+			td.set('cost', cost.unsqueeze(0))
 		return td
 
 	def train(self):
@@ -109,7 +115,7 @@ class OnlineTrainer(Trainer):
 			else:
 				action = self.env.rand_act()
 			obs, reward, done, info = self.env.step(action)
-			self._tds.append(self.to_td(obs, action, reward, info['terminated']))
+			self._tds.append(self.to_td(obs, action, reward, info['terminated'], info.get('cost', None)))
 
 			# Update agent
 			if self._step >= self.cfg.seed_steps:

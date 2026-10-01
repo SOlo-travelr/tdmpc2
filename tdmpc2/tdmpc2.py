@@ -18,12 +18,16 @@ class TDMPC2(torch.nn.Module):
 	def __init__(self, cfg):
 		super().__init__()
 		self.cfg = cfg
+		if cfg.get('use_safe_planner', False):
+			assert cfg.get('use_cost_head', False), \
+				'use_safe_planner=true requires use_cost_head=true (the planner needs the cost head).'
 		self.device = torch.device('cuda:0')
 		self.model = WorldModel(cfg).to(self.device)
 		self.optim = torch.optim.Adam([
 			{'params': self.model._encoder.parameters(), 'lr': self.cfg.lr*self.cfg.enc_lr_scale},
 			{'params': self.model._dynamics.parameters()},
 			{'params': self.model._reward.parameters()},
+			{'params': self.model._cost.parameters() if self.cfg.get('use_cost_head', False) else []},
 			{'params': self.model._termination.parameters() if self.cfg.episodic else []},
 			{'params': self.model._Qs.parameters()},
 			{'params': self.model._task_emb.parameters() if self.cfg.multitask else []
@@ -124,9 +128,12 @@ class TDMPC2(torch.nn.Module):
 	def _estimate_value(self, z, actions, task):
 		"""Estimate value of a trajectory starting at latent state z and executing given actions."""
 		G, discount = 0, 1
+		cost_sum = 0
 		termination = torch.zeros(self.cfg.num_samples, 1, dtype=torch.float32, device=z.device)
 		for t in range(self.cfg.horizon):
 			reward = math.two_hot_inv(self.model.reward(z, actions[t], task), self.cfg)
+			if self.cfg.use_safe_planner:
+				cost_sum = cost_sum + discount * (1-termination) * self.model.cost(z, actions[t], task)
 			z = self.model.next(z, actions[t], task)
 			G = G + discount * (1-termination) * reward
 			discount_update = self.discount[torch.tensor(task)] if self.cfg.multitask else self.discount
@@ -134,7 +141,14 @@ class TDMPC2(torch.nn.Module):
 			if self.cfg.episodic:
 				termination = torch.clip(termination + (self.model.termination(z, task) > 0.5).float(), max=1.)
 		action, _ = self.model.pi(z, task)
-		return G + discount * (1-termination) * self.model.Q(z, action, task, return_type='avg')
+		value = G + discount * (1-termination) * self.model.Q(z, action, task, return_type='avg')
+		if self.cfg.use_safe_planner:
+			# SafeDreamer-style constrained objective: penalize imagined cost, and
+			# hard-reject trajectories whose discounted cost exceeds the budget.
+			value = value - self.cfg.lambda_safe * cost_sum
+			if self.cfg.cost_budget > 0:
+				value = value - 1e4 * (cost_sum > self.cfg.cost_budget).float()
+		return value
 
 	@torch.no_grad()
 	def _plan(self, obs, t0=False, eval_mode=False, task=None):
@@ -257,7 +271,7 @@ class TDMPC2(torch.nn.Module):
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		return reward + discount * (1-terminated) * self.model.Q(next_z, action, task, return_type='min', target=True)
 
-	def _update(self, obs, action, reward, terminated, task=None):
+	def _update(self, obs, action, reward, terminated, cost=None, task=None):
 		# Compute targets
 		with torch.no_grad():
 			next_z = self.model.encode(obs[1:], task)
@@ -297,11 +311,18 @@ class TDMPC2(torch.nn.Module):
 		else:
 			termination_loss = 0.
 		value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
+		cost_loss = 0.
+		if self.cfg.use_cost_head:
+			cost_preds = self.model.cost(_zs, action, task)
+			for t, (cost_pred_unbind, cost_unbind) in enumerate(zip(cost_preds.unbind(0), cost.unbind(0))):
+				cost_loss = cost_loss + F.mse_loss(cost_pred_unbind, cost_unbind) * self.cfg.rho**t
+			cost_loss = cost_loss / self.cfg.horizon
 		total_loss = (
 			self.cfg.consistency_coef * consistency_loss +
 			self.cfg.reward_coef * reward_loss +
 			self.cfg.termination_coef * termination_loss +
-			self.cfg.value_coef * value_loss
+			self.cfg.value_coef * value_loss +
+			self.cfg.cost_coef * cost_loss
 		)
 
 		# Update model
@@ -326,6 +347,8 @@ class TDMPC2(torch.nn.Module):
 			"total_loss": total_loss,
 			"grad_norm": grad_norm,
 		})
+		if self.cfg.use_cost_head:
+			info["cost_loss"] = cost_loss if isinstance(cost_loss, torch.Tensor) else torch.tensor(cost_loss)
 		if self.cfg.episodic:
 			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]))
 		info.update(pi_info)
@@ -341,9 +364,9 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			dict: Dictionary of training statistics.
 		"""
-		obs, action, reward, terminated, task = buffer.sample()
+		obs, action, reward, terminated, cost, task = buffer.sample()
 		kwargs = {}
 		if task is not None:
 			kwargs["task"] = task
 		torch.compiler.cudagraph_mark_step_begin()
-		return self._update(obs, action, reward, terminated, **kwargs)
+		return self._update(obs, action, reward, terminated, cost=cost, **kwargs)

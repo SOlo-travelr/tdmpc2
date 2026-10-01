@@ -29,6 +29,10 @@ try:
 	from envs.mujoco import make_env as make_mujoco_env
 except:
 	make_mujoco_env = missing_dependencies
+try:
+	from envs.battery import make_env as make_battery_env
+except:
+	make_battery_env = missing_dependencies
 
 
 warnings.filterwarnings('ignore', category=DeprecationWarning)
@@ -59,13 +63,16 @@ def make_env(cfg):
 	"""
 	Make an environment for TD-MPC2 experiments.
 	"""
-	gym.logger.set_level(40)
+	try:
+		gym.logger.set_level(40)
+	except AttributeError:
+		gym.logger.min_level = 40
 	if cfg.multitask:
 		env = make_multitask_env(cfg)
 
 	else:
 		env = None
-		for fn in [make_dm_control_env, make_maniskill_env, make_metaworld_env, make_myosuite_env, make_mujoco_env]:
+		for fn in [make_dm_control_env, make_maniskill_env, make_metaworld_env, make_myosuite_env, make_mujoco_env, make_battery_env]:
 			try:
 				env = fn(cfg)
 			except ValueError:

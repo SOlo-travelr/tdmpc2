@@ -51,6 +51,13 @@ num_bins: 101
 vmin: -10
 vmax: +10
 
+# safety (battery / SafeDreamer-style cost integration)
+use_cost_head: false
+use_safe_planner: false
+cost_coef: 0.1
+lambda_safe: 1.0
+cost_budget: 0.0
+
 # architecture
 model_size: ???
 num_enc_layers: 2
